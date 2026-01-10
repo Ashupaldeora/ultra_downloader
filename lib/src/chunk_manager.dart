@@ -195,3 +195,11 @@ class ChunkManager {
     return chunks;
   }
 }
+
+class DownloadProgress {
+  final String taskId;
+  final double progress;
+  final DownloadStatus status;
+
+  DownloadProgress(this.taskId, this.progress, this.status);
+}

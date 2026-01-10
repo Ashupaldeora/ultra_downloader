@@ -35,7 +35,7 @@ class DownloadScreen extends StatefulWidget {
 
 class _DownloadScreenState extends State<DownloadScreen> {
   final String _url =
-      'https://bcdnxw.hakunaymatata.com/tran-audio/20250525/new-eafe5efa25631073f7f0594d856b240c.mp4?sign=b8d06adbfdbbde1c05ddd1297e9c0e46&t=1768034940';
+      '';
   // Use a large file for better testing if possible
   // 'https://speed.hetzner.de/100MB.bin';
 

@@ -1,62 +1,14 @@
 import 'dart:async';
-import 'dart:convert';
-import 'dart:io';
 import 'dart:isolate';
 
 import 'package:flutter/widgets.dart'; // For WidgetsFlutterBinding
-import 'package:path_provider/path_provider.dart';
 import 'package:uuid/uuid.dart';
-import 'package:workmanager/workmanager.dart';
 
 import 'src/chunk_manager.dart';
 import 'src/downloader_isolate.dart';
 
 export 'src/chunk_manager.dart'
-    show ChunkingStrategy, DownloadStatus, StrategyType;
-
-const _kWorkManagerTag = 'ultra_downloader_bg_task';
-const _kWorkManagerUniqueName = 'ultra_downloader_periodic';
-
-/// The specific callback for WorkManager.
-@pragma('vm:entry-point')
-void callbackDispatcher() {
-  Workmanager().executeTask((task, inputData) async {
-    // Background execution logic
-    // 1. Scan for .meta files in app documents
-    // 2. If found incomplete, try to resume (download a bit?)
-    // This is tricky because OS kills us quickly.
-    // Ideally we just check and maybe mark them or try to download 1 chunk.
-    try {
-      // We can't easily spawn the complex isolate here without context.
-      // But we can do a quick check and cleanup or small retry.
-      // For now, we will just print/log as "Background Check Active".
-      // A full background implementation requires a different architecture (native workers)
-      // which the user alluded to with "smart backgrounding".
-      // But strictly "pure dart" means we rely on Dart execution period.
-
-      // Let's implement a "Recovery Scanner"
-      // Note: PathProvider works in background isolate.
-      final docDir = await getApplicationDocumentsDirectory();
-      final files = docDir.listSync(recursive: true);
-      for (var f in files) {
-        if (f.path.endsWith('.meta')) {
-          // Check content
-          final content = File(f.path).readAsStringSync();
-          final json = jsonDecode(content);
-          final task = DownloadTask.fromJson(json);
-          // If paused or failed, good. If downloading but stuck (process killed), reset to paused.
-          if (task.status == DownloadStatus.downloading) {
-            task.status = DownloadStatus.paused;
-            File(f.path).writeAsStringSync(jsonEncode(task.toJson()));
-          }
-        }
-      }
-    } catch (e) {
-      debugPrint('UltraDownloader Background Error: $e');
-    }
-    return Future.value(true);
-  });
-}
+    show ChunkingStrategy, DownloadStatus, StrategyType, DownloadProgress;
 
 class UltraDownloader {
   static final UltraDownloader _instance = UltraDownloader._internal();
@@ -110,13 +62,11 @@ class UltraDownloader {
 
     await completer.future;
 
-    // Initialize WorkManager
-    await Workmanager().initialize(callbackDispatcher);
+    if (_debug) debugPrint('[UltraDownloader] Initialized');
 
     // Clean up "stuck" downloads from previous crash
     // We can ask the isolate to do this, or do it here?
-    // Doing it here is blocking the UI thread (if async io), isolate is better.
-    // For now, rely on background task or user action.
+    // For now, allow isolate to handle resumption via .meta files on its own.
 
     _isInitialized = true;
   }
@@ -131,7 +81,7 @@ class UltraDownloader {
     Map<String, dynamic>? headers,
     ChunkingStrategy? strategy,
   }) async {
-    if (!_isInitialized) await initialize();
+    if (!_isInitialized) await initialize(debug: _debug);
 
     final taskId = const Uuid().v4();
     final task = DownloadTask(
@@ -162,29 +112,9 @@ class UltraDownloader {
     _isolateSendPort?.send({'command': 'cancel', 'taskId': taskId});
   }
 
-  /// Register background periodic task (Optional convenience method)
-  Future<void> registerBackgroundRecovery() async {
-    await Workmanager().registerPeriodicTask(
-      _kWorkManagerUniqueName,
-      _kWorkManagerTag,
-      frequency: const Duration(minutes: 15),
-      constraints: Constraints(
-        networkType: NetworkType.connected,
-      ),
-    );
-  }
-
   void dispose() {
     _isolate?.kill();
     _statusController.close();
     _receivePort?.close();
   }
-}
-
-class DownloadProgress {
-  final String taskId;
-  final double progress;
-  final DownloadStatus status;
-
-  DownloadProgress(this.taskId, this.progress, this.status);
 }

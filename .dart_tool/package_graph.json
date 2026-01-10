@@ -11,8 +11,7 @@
         "flutter",
         "path",
         "path_provider",
-        "uuid",
-        "workmanager"
+        "uuid"
       ],
       "devDependencies": [
         "flutter_test",
@@ -49,16 +48,6 @@
         "crypto",
         "fixnum",
         "meta"
-      ]
-    },
-    {
-      "name": "workmanager",
-      "version": "0.9.0+3",
-      "dependencies": [
-        "flutter",
-        "workmanager_android",
-        "workmanager_apple",
-        "workmanager_platform_interface"
       ]
     },
     {
@@ -192,31 +181,6 @@
       "version": "3.0.7",
       "dependencies": [
         "typed_data"
-      ]
-    },
-    {
-      "name": "workmanager_apple",
-      "version": "0.9.1+2",
-      "dependencies": [
-        "flutter",
-        "workmanager_platform_interface"
-      ]
-    },
-    {
-      "name": "workmanager_android",
-      "version": "0.9.0+2",
-      "dependencies": [
-        "flutter",
-        "workmanager_platform_interface"
-      ]
-    },
-    {
-      "name": "workmanager_platform_interface",
-      "version": "0.9.1+1",
-      "dependencies": [
-        "flutter",
-        "meta",
-        "plugin_platform_interface"
       ]
     },
     {
@@ -372,16 +336,16 @@
       ]
     },
     {
+      "name": "ffi",
+      "version": "2.1.5",
+      "dependencies": []
+    },
+    {
       "name": "plugin_platform_interface",
       "version": "2.1.8",
       "dependencies": [
         "meta"
       ]
-    },
-    {
-      "name": "ffi",
-      "version": "2.1.5",
-      "dependencies": []
     },
     {
       "name": "platform",
