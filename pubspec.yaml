@@ -1,0 +1,22 @@
+name: ultra_downloader
+description: A high-performance, robust download manager for Flutter with support for parallel chunking and background execution.
+version: 1.0.0
+homepage: https://github.com/ashu/ultra_downloader
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+  flutter: ">=3.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  dio: ^5.4.0
+  path_provider: ^2.1.2
+  path: ^1.9.0
+  workmanager: ^0.9.0
+  uuid: ^4.3.3 # For unique task IDs
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  lints: ^3.0.0
