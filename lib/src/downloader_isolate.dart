@@ -5,6 +5,7 @@ import 'dart:isolate';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'dart:ui'; // For IsolateNameServer
 import 'package:dio/dio.dart';
 import 'chunk_manager.dart';
 
@@ -307,7 +308,9 @@ class _DownloaderIsolate {
     runtime.task.status = DownloadStatus.completed;
     _saveMetadata(runtime.task); // Keep metadata? Or delete? Usually delete.
     // Let's delete metadata on success to clean up.
-    File('${runtime.task.savePath}.meta').deleteSync();
+    // We KEEP the metadata file as a source of truth for the "Completed" state.
+    // This allows the app to know a file is finished even after a full restart / cache clear.
+    _saveMetadata(runtime.task);
     _broadcastStatus(runtime);
     _activeTasks.remove(runtime.task.id);
     _pausedTasks.remove(runtime.task.id);
@@ -336,6 +339,19 @@ class _DownloaderIsolate {
       'progress': runtime.task.progress,
       'status': runtime.task.status.index
     });
+
+    // GENERIC MONITORING: (Added for Foreground Service Support)
+    // Check if any external monitor is listening (e.g., Foreground Service)
+    final monitorPort =
+        IsolateNameServer.lookupPortByName('ultra_downloader_monitor_port');
+    if (monitorPort != null) {
+      monitorPort.send({
+        'type': 'progress',
+        'taskId': runtime.task.id,
+        'progress': runtime.task.progress,
+        'status': runtime.task.status.index
+      });
+    }
   }
 }
 

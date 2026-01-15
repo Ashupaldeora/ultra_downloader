@@ -80,10 +80,11 @@ class UltraDownloader {
     String savePath, {
     Map<String, dynamic>? headers,
     ChunkingStrategy? strategy,
+    String? id,
   }) async {
     if (!_isInitialized) await initialize(debug: _debug);
 
-    final taskId = const Uuid().v4();
+    final taskId = id ?? const Uuid().v4();
     final task = DownloadTask(
       id: taskId,
       url: url,
