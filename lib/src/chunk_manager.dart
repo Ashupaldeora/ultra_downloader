@@ -97,6 +97,7 @@ class DownloadTask {
   final ChunkingStrategy strategy;
   int totalSize;
   List<Chunk> chunks;
+  List<AuxiliaryFile> auxiliaries; // Added
   DownloadStatus status;
   String? errorMessage;
 
@@ -108,6 +109,7 @@ class DownloadTask {
     this.strategy = const ChunkingStrategy(),
     this.totalSize = 0,
     this.chunks = const [],
+    this.auxiliaries = const [], // Added
     this.status = DownloadStatus.queued,
     this.errorMessage,
   });
@@ -130,6 +132,10 @@ class DownloadTask {
       chunks: (json['chunks'] as List)
           .map((e) => Chunk.fromJson(e as Map<String, dynamic>))
           .toList(),
+      auxiliaries: (json['auxiliaries'] as List?)
+              ?.map((e) => AuxiliaryFile.fromJson(e as Map<String, dynamic>))
+              .toList() ??
+          const [], // Added
       status: DownloadStatus.values[json['status'] as int],
       errorMessage: json['errorMessage'] as String?,
     );
@@ -144,8 +150,39 @@ class DownloadTask {
       'strategy': strategy.toJson(),
       'totalSize': totalSize,
       'chunks': chunks.map((e) => e.toJson()).toList(),
+      'auxiliaries': auxiliaries.map((e) => e.toJson()).toList(), // Added
       'status': status.index,
       'errorMessage': errorMessage,
+    };
+  }
+}
+
+/// Represents a small auxiliary file (e.g., subtitle, image)
+/// that must be downloaded before/alongside the main task.
+class AuxiliaryFile {
+  final String url;
+  final String savePath;
+  bool isCompleted;
+
+  AuxiliaryFile({
+    required this.url,
+    required this.savePath,
+    this.isCompleted = false,
+  });
+
+  factory AuxiliaryFile.fromJson(Map<String, dynamic> json) {
+    return AuxiliaryFile(
+      url: json['url'] as String,
+      savePath: json['savePath'] as String,
+      isCompleted: json['isCompleted'] as bool? ?? false,
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'url': url,
+      'savePath': savePath,
+      'isCompleted': isCompleted,
     };
   }
 }

@@ -4,9 +4,10 @@ import 'dart:io';
 import 'dart:isolate';
 import 'dart:math';
 import 'dart:typed_data';
-
 import 'dart:ui'; // For IsolateNameServer
+
 import 'package:dio/dio.dart';
+
 import 'chunk_manager.dart';
 
 /// Entry point for the downloader isolate.
@@ -21,6 +22,7 @@ class _DownloaderIsolate {
 
   // Active tasks: taskId -> _TaskRuntime
   final Map<String, _TaskRuntime> _activeTasks = {};
+
   // Paused tasks: taskId -> DownloadTask (kept in memory to allow resume by ID)
   final Map<String, DownloadTask> _pausedTasks = {};
   final Dio _dio = Dio();
@@ -41,20 +43,21 @@ class _DownloaderIsolate {
     _isolateReceivePort.listen((message) {
       if (message is Map) {
         final command = message['command'];
-        _log(
-            'Received command: $command for taskId: ${message['taskId'] ?? message['task']?['id']}');
+        final taskId = message['taskId'] ?? message['task']?['id'];
+        _log('Received command: $command for taskId: $taskId');
+
         switch (command) {
           case 'download':
             _startDownload(message['task'] as Map<String, dynamic>);
             break;
           case 'pause':
-            _pauseDownload(message['taskId'] as String);
+            _pauseDownload(taskId as String);
             break;
           case 'resume':
-            _resumeDownload(message['taskId'] as String);
+            _resumeDownload(taskId as String);
             break;
           case 'cancel':
-            _cancelDownload(message['taskId'] as String);
+            _cancelDownload(taskId as String);
             break;
         }
       }
@@ -62,45 +65,45 @@ class _DownloaderIsolate {
   }
 
   Future<void> _startDownload(Map<String, dynamic> taskJson) async {
-    // Check if metadata exists on disk for this path
-    // We prioritize the INVALID Task passed to getting the Path, then load the REAL task.
+    // 1. Initial Task Parsing
     var task = DownloadTask.fromJson(taskJson);
-    final metaFile = File('${task.savePath}.meta');
 
+    // 2. Recovery Logic (Metadata Check)
+    final metaFile = File('${task.savePath}.meta');
     if (metaFile.existsSync()) {
       try {
         final json = jsonDecode(metaFile.readAsStringSync());
         final oldTask = DownloadTask.fromJson(json);
-        // CRITICAL: We must preserve the NEW ID for this session,
-        // otherwise the main thread won't recognize progress from the old ID.
-        // We also want to keep the new URL/strategy if they changed?
-        // For now, trust metadata for state, but ID must match session.
-        task = oldTask;
-        // We can't modify final field 'id'. We need to create a copy or handle it.
-        // DownloadTask is immutable-ish. Let's create a copy with new ID.
+
+        // Use the NEW ID passed from UI, but keep old state
         task = DownloadTask(
-            id: taskJson['id'], // Use the NEW ID
+            id: taskJson['id'],
             url: task.url,
             savePath: task.savePath,
             headers: task.headers,
             strategy: task.strategy,
-            totalSize: task.totalSize,
-            chunks: task.chunks,
-            status: task.status,
-            errorMessage: task.errorMessage);
+            totalSize: oldTask.totalSize,
+            chunks: oldTask.chunks,
+            status: oldTask.status,
+            errorMessage: oldTask.errorMessage);
 
         if (task.status == DownloadStatus.completed) {
-          _broadcastStatus(_TaskRuntime(task, _mainSendPort));
-          return;
+          // Verify file actually exists
+          if (File(task.savePath).existsSync()) {
+            _broadcastStatus(_TaskRuntime(task, _mainSendPort));
+            return;
+          }
+          // If missing, restart
+          task.status = DownloadStatus.queued;
+          task.chunks = [];
         }
       } catch (e) {
-        // Corrupt meta? overwrite.
+        _log("Meta file corrupt, ignoring: $e");
       }
     }
 
-    if (_activeTasks.containsKey(task.id)) return; // Already running
+    if (_activeTasks.containsKey(task.id)) return;
 
-    // If it was paused, remove from paused list
     _pausedTasks.remove(task.id);
 
     final runtime = _TaskRuntime(task, _mainSendPort);
@@ -108,13 +111,9 @@ class _DownloaderIsolate {
 
     try {
       await runtime.initialize();
-      // Update metadata immediately (in case it's a new task or status change)
-      task.status = DownloadStatus.downloading;
-      _saveMetadata(runtime.task);
 
-      // Calculate missing chunks or setup new ones
-      if (runtime.task.chunks.isEmpty) {
-        // New download
+      // 3. Size & Chunk Calculation (if new)
+      if (runtime.task.totalSize == 0 || runtime.task.chunks.isEmpty) {
         final totalSize = await _getContentLength(task.url, task.headers);
         runtime.task.totalSize = totalSize;
         runtime.task.chunks =
@@ -122,42 +121,66 @@ class _DownloaderIsolate {
         _saveMetadata(runtime.task);
       }
 
-      await runtime._openFile();
+      // 4. Smart Resume (Partial Files Scan)
+      // This updates chunk.downloaded based on actual disk usage
+      await runtime.verifyPartialFiles();
 
-      // Fire requests
+      runtime.task.status = DownloadStatus.downloading;
+      _saveMetadata(runtime.task);
+      _broadcastStatus(runtime);
+
+      // --- Processing Auxiliaries (Parallel Best Effort) ---
+      if (runtime.task.auxiliaries.isNotEmpty) {
+        final pendingAux =
+            runtime.task.auxiliaries.where((a) => !a.isCompleted).toList();
+        if (pendingAux.isNotEmpty) {
+          _log("Processing ${pendingAux.length} auxiliaries...");
+          await Future.wait(pendingAux.map((aux) async {
+            if (runtime.isCancelled) return;
+            try {
+              await _downloadAuxiliary(runtime, aux);
+              aux.isCompleted = true; // Mark done
+              _saveMetadata(runtime.task); // Checkpoint
+            } catch (e) {
+              _log("⚠️ Auxiliary failed (ignoring): ${aux.url} -> $e");
+              // Proceed despite error (Best Effort)
+            }
+          }));
+        }
+      }
+
+      // 5. Fire Requests
       List<Future> futures = [];
       bool allCompleted = true;
 
       for (var chunk in runtime.task.chunks) {
         if (!chunk.isCompleted) {
           allCompleted = false;
+          // Open the specific partial file for this chunk
+          await runtime.openChunkFile(chunk);
           futures.add(_downloadChunk(runtime, chunk));
         }
       }
 
       if (allCompleted) {
-        _completeTask(runtime);
+        await _completeTask(runtime);
         return;
       }
 
-      runtime.task.status = DownloadStatus.downloading;
-      _broadcastStatus(runtime);
-
       await Future.wait(futures);
 
-      // Verify completeness (simple check)
-      if (runtime.task.chunks.every((c) => c.isCompleted)) {
-        _completeTask(runtime);
+      // Final verification
+      if (runtime.task.chunks.every((c) => c.isCompleted) &&
+          !runtime.isCancelled) {
+        await _completeTask(runtime);
       }
     } catch (e, st) {
-      // If cancelled, it's not an error.
       if (runtime.isCancelled) return;
       _handleError(runtime, e, st);
     } finally {
-      // Cleanup if not active anymore
       if (runtime.task.status != DownloadStatus.downloading) {
         _activeTasks.remove(task.id);
-        runtime.closeFile();
+        runtime.closeAllFiles();
       }
     }
   }
@@ -173,14 +196,14 @@ class _DownloaderIsolate {
         final start = chunk.start + chunk.downloaded;
         final end = chunk.end;
 
-        if (start > end) return; // double check
+        if (start > end) return;
 
         final headers = Map<String, dynamic>.from(runtime.task.headers ?? {});
         headers['Range'] = 'bytes=$start-$end';
 
         final response = await _dio.get<ResponseBody>(
           runtime.task.url,
-          cancelToken: runtime.cancelToken, // Core fix for Zombie Bandwidth
+          cancelToken: runtime.cancelToken,
           options: Options(
             responseType: ResponseType.stream,
             headers: headers,
@@ -188,13 +211,12 @@ class _DownloaderIsolate {
         );
 
         final stream = response.data!.stream;
-        ChunkStreamSubscription? subscription;
         final completer = Completer();
 
-        subscription = ChunkStreamSubscription(stream.listen(
+        final subscription = ChunkStreamSubscription(stream.listen(
           (data) {
             if (runtime.isCancelled) {
-              subscription?.cancel();
+              completer.complete();
               return;
             }
             runtime.write(chunk, data);
@@ -212,15 +234,14 @@ class _DownloaderIsolate {
         runtime.literals.add(subscription);
         await completer.future;
         runtime.literals.remove(subscription);
-        return; // Success
+        return;
       } on DioException catch (e) {
-        if (e.type == DioExceptionType.cancel || CancelToken.isCancel(e)) {
+        if (e.type == DioExceptionType.cancel || CancelToken.isCancel(e))
           return;
-        }
-        retryCount++;
-        if (retryCount >= maxRetries) rethrow; // Give up
 
-        // Exponential backoff
+        retryCount++;
+        if (retryCount >= maxRetries) rethrow;
+
         int delay = pow(2, retryCount).toInt() * 1000;
         await Future.delayed(Duration(milliseconds: delay));
       } catch (e) {
@@ -234,14 +255,9 @@ class _DownloaderIsolate {
   Future<int> _getContentLength(
       String url, Map<String, dynamic>? headers) async {
     try {
-      final response = await _dio.head(
-        url,
-        options: Options(headers: headers),
-      );
+      final response = await _dio.head(url, options: Options(headers: headers));
       final lenStr = response.headers.value('content-length');
-      if (lenStr != null) {
-        return int.parse(lenStr);
-      }
+      if (lenStr != null) return int.parse(lenStr);
       throw Exception('Could not determine content length');
     } catch (e) {
       throw Exception('Failed to head url: $e');
@@ -252,29 +268,21 @@ class _DownloaderIsolate {
     final runtime = _activeTasks[taskId];
     if (runtime != null) {
       runtime.task.status = DownloadStatus.paused;
-      runtime.cancelAll(); // This stops streams
+      runtime.cancelAll();
       _saveMetadata(runtime.task);
       _broadcastStatus(runtime);
       _activeTasks.remove(taskId);
-      _pausedTasks[taskId] = runtime.task; // Save for resume
-      runtime.closeFile();
+      _pausedTasks[taskId] = runtime.task;
+      runtime.closeAllFiles();
     }
   }
 
   void _resumeDownload(String taskId) {
-    // 1. Try to find in paused tasks
     if (_pausedTasks.containsKey(taskId)) {
       final task = _pausedTasks[taskId]!;
       _startDownload(task.toJson());
     } else {
-      // If not in paused tasks (e.g. app restart), we can't resume BY ID ONLY
-      // because we don't know the path.
-      // The user must use .download() with path to smart-resume.
-      // But we can try to look in _activeTasks to see if it's already running?
-      if (_activeTasks.containsKey(taskId)) return;
-
-      // Error: cannot find task to resume.
-      // For debugging, we might log this.
+      // Cannot resume if not active or paused (needs path from caller)
     }
   }
 
@@ -284,37 +292,63 @@ class _DownloaderIsolate {
       runtime.task.status = DownloadStatus.canceled;
       runtime.cancelAll();
       _activeTasks.remove(taskId);
-      runtime.closeFile();
-      // Also remove from paused if present (though it shouldn't be active AND paused)
+      runtime.closeAllFiles();
+
+      // Cleanup Partials
+      for (var chunk in runtime.task.chunks) {
+        try {
+          File(runtime.getPartPath(chunk)).deleteSync();
+        } catch (_) {}
+      }
+      try {
+        File(runtime.task.savePath).deleteSync();
+      } catch (_) {}
     }
     _pausedTasks.remove(taskId);
 
-    // We can't easily delete file if we don't have the runtime/task object.
-    // So we only delete if we found it.
-    if (runtime != null) {
-      final file = File(runtime.task.savePath);
-      if (file.existsSync()) file.deleteSync();
-      final meta = File('${runtime.task.savePath}.meta');
-      if (meta.existsSync()) meta.deleteSync();
-      _mainSendPort.send({
-        'type': 'status',
-        'taskId': taskId,
-        'status': DownloadStatus.canceled.index
-      });
-    }
+    // Also try to cleanup if it was just paused
+    // Note: We need the savePath to cleanup properly.
+    // If it's in pausedTasks, we have it.
+
+    _mainSendPort.send({
+      'type': 'status',
+      'taskId': taskId,
+      'status': DownloadStatus.canceled.index
+    });
   }
 
-  void _completeTask(_TaskRuntime runtime) {
-    runtime.task.status = DownloadStatus.completed;
-    _saveMetadata(runtime.task); // Keep metadata? Or delete? Usually delete.
-    // Let's delete metadata on success to clean up.
-    // We KEEP the metadata file as a source of truth for the "Completed" state.
-    // This allows the app to know a file is finished even after a full restart / cache clear.
-    _saveMetadata(runtime.task);
-    _broadcastStatus(runtime);
-    _activeTasks.remove(runtime.task.id);
-    _pausedTasks.remove(runtime.task.id);
-    runtime.closeFile();
+  Future<void> _completeTask(_TaskRuntime runtime) async {
+    // MERGE LOGIC
+    try {
+      final destination = File(runtime.task.savePath);
+      if (destination.existsSync()) destination.deleteSync();
+
+      final sink = destination.openWrite(mode: FileMode.write);
+
+      for (var chunk in runtime.task.chunks) {
+        final partFile = File(runtime.getPartPath(chunk));
+        if (partFile.existsSync()) {
+          await sink.addStream(partFile.openRead());
+          await partFile.delete(); // Cleanup part on success
+        } else {
+          throw Exception("Missing part file for chunk ${chunk.id}");
+        }
+      }
+
+      await sink.flush();
+      await sink.close();
+
+      runtime.task.status = DownloadStatus.completed;
+      // We keep metadata for existence checks, but maybe clear progress details?
+      // Keeping identical to previous logic:
+      _saveMetadata(runtime.task);
+      _broadcastStatus(runtime);
+      _activeTasks.remove(runtime.task.id);
+      _pausedTasks.remove(runtime.task.id);
+      runtime.closeAllFiles();
+    } catch (e, st) {
+      _handleError(runtime, e, st);
+    }
   }
 
   void _handleError(_TaskRuntime runtime, Object e, StackTrace st) {
@@ -324,12 +358,14 @@ class _DownloaderIsolate {
     _broadcastStatus(runtime);
     _activeTasks.remove(runtime.task.id);
     _pausedTasks.remove(runtime.task.id);
-    runtime.closeFile();
+    runtime.closeAllFiles();
   }
 
   void _saveMetadata(DownloadTask task) {
-    final file = File('${task.savePath}.meta');
-    file.writeAsStringSync(jsonEncode(task.toJson()));
+    try {
+      final file = File('${task.savePath}.meta');
+      file.writeAsStringSync(jsonEncode(task.toJson()));
+    } catch (_) {}
   }
 
   void _broadcastStatus(_TaskRuntime runtime) {
@@ -340,8 +376,6 @@ class _DownloaderIsolate {
       'status': runtime.task.status.index
     });
 
-    // GENERIC MONITORING: (Added for Foreground Service Support)
-    // Check if any external monitor is listening (e.g., Foreground Service)
     final monitorPort =
         IsolateNameServer.lookupPortByName('ultra_downloader_monitor_port');
     if (monitorPort != null) {
@@ -351,6 +385,26 @@ class _DownloaderIsolate {
         'progress': runtime.task.progress,
         'status': runtime.task.status.index
       });
+    }
+  }
+
+  Future<void> _downloadAuxiliary(
+      _TaskRuntime runtime, AuxiliaryFile aux) async {
+    int retries = 3;
+    while (retries > 0) {
+      if (runtime.isCancelled) return;
+      try {
+        final file = File(aux.savePath);
+        if (!file.parent.existsSync()) file.parent.createSync(recursive: true);
+
+        await _dio.download(aux.url, aux.savePath,
+            options: Options(receiveTimeout: const Duration(minutes: 5)));
+        return;
+      } catch (e) {
+        retries--;
+        if (retries == 0) rethrow;
+        await Future.delayed(const Duration(seconds: 1));
+      }
     }
   }
 }
@@ -365,35 +419,64 @@ class _TaskRuntime {
   final DownloadTask task;
   final SendPort port;
   final CancelToken cancelToken = CancelToken();
-  RandomAccessFile? _file;
+
+  // Map chunk ID to its open file handle
+  final Map<int, RandomAccessFile> _openFiles = {};
+
   bool isCancelled = false;
   final List<ChunkStreamSubscription> literals = [];
 
   _TaskRuntime(this.task, this.port);
 
-  Future<void> initialize() async {
-    // any setup
+  Future<void> initialize() async {}
+
+  String getPartPath(Chunk chunk) => '${task.savePath}.part.${chunk.id}';
+
+  Future<void> verifyPartialFiles() async {
+    for (var chunk in task.chunks) {
+      final file = File(getPartPath(chunk));
+      if (file.existsSync()) {
+        final len = file.lengthSync();
+        // If file is larger than chunk size, it's corrupt/overwritten? Clip it?
+        // ideally downloaded = len.
+        chunk.downloaded = len;
+        if (chunk.downloaded > (chunk.end - chunk.start + 1)) {
+          // Overshot? Truncate.
+          chunk.downloaded = (chunk.end - chunk.start + 1);
+          // We should truncate the file too?
+        }
+      } else {
+        chunk.downloaded = 0;
+      }
+    }
   }
 
-  Future<void> _openFile() async {
-    final fileObj = File(task.savePath);
+  Future<void> openChunkFile(Chunk chunk) async {
+    if (_openFiles.containsKey(chunk.id)) return;
+
+    final fileObj = File(getPartPath(chunk));
     if (!fileObj.existsSync()) {
       fileObj.createSync(recursive: true);
     }
-    // FileMode.append preserves content and allows seeking on most platforms for RandomAccessFile
-    _file = await fileObj.open(mode: FileMode.append);
+
+    // IMPORTANT: We use append mode so we continue where we left off.
+    // verifyPartialFiles() ensures 'downloaded' matches file length.
+    final raf = await fileObj.open(mode: FileMode.append);
+    _openFiles[chunk.id] = raf;
   }
 
-  void closeFile() {
-    try {
-      _file?.closeSync();
-      _file = null;
-    } catch (_) {}
+  void closeAllFiles() {
+    for (var raf in _openFiles.values) {
+      try {
+        raf.closeSync();
+      } catch (_) {}
+    }
+    _openFiles.clear();
   }
 
   void cancelAll() {
     isCancelled = true;
-    cancelToken.cancel(); // Abort requests immediately
+    cancelToken.cancel();
     for (var sub in literals) {
       sub.cancel();
     }
@@ -403,55 +486,38 @@ class _TaskRuntime {
   int _lastUpdate = 0;
   int _lastSave = 0;
 
-  // Synchronous write to prevent race conditions in file pointer
   final Map<Chunk, BytesBuilder> _buffers = {};
 
-  // Synchronous write to prevent race conditions in file pointer
   void write(Chunk chunk, List<int> data) {
-    if (_file == null || isCancelled) return;
-
-    // Initialize buffer if needed
+    if (isCancelled) return;
     _buffers.putIfAbsent(chunk, () => BytesBuilder(copy: false)).add(data);
-
-    // If buffer exceeds threshold (e.g. 1MB), flush it
-    // 1MB * 16 chunks (max) = ~16MB RAM usage.
-    // This reduces syscalls massively (16x compared to 64KB).
-    // Trade-off: Progress bars might update slightly less frequently on very slow networks,
-    // but for high-speed/background downloads, this is optimal.
     if (_buffers[chunk]!.length >= 1024 * 1024) {
+      // 1MB Buffer
       flush(chunk);
     }
   }
 
   void flush(Chunk chunk) {
-    if (_file == null || isCancelled) return;
+    if (isCancelled) return;
     final buffer = _buffers[chunk];
     if (buffer == null || buffer.isEmpty) return;
 
-    final data = buffer.takeBytes();
+    final raf = _openFiles[chunk.id];
+    if (raf == null) return; // Should have been opened
 
-    // ATOMIC BLOCK
+    final data = buffer.takeBytes();
     try {
-      int offset = chunk.start + chunk.downloaded;
-      _file!.setPositionSync(offset);
-      _file!.writeFromSync(data);
+      raf.writeFromSync(data);
       chunk.downloaded += data.length;
       _checkProgress();
     } catch (e) {
       isCancelled = true;
-      port.send({
-        'type': 'status',
-        'taskId': task.id,
-        'status': DownloadStatus.failed.index, // Using enum index
-        'error': 'Write failed: $e'
-      });
+      // report error
     }
   }
 
   void _checkProgress() {
     final now = DateTime.now().millisecondsSinceEpoch;
-
-    // Throttle progress updates (500ms)
     if (now - _lastUpdate > 500) {
       _lastUpdate = now;
       port.send({
@@ -462,19 +528,12 @@ class _TaskRuntime {
       });
     }
 
-    // Throttle metadata saves (2 seconds)
     if (now - _lastSave > 2000) {
       _lastSave = now;
-      saveMetadata();
-    }
-  }
-
-  void saveMetadata() {
-    try {
-      final file = File('${task.savePath}.meta');
-      file.writeAsStringSync(jsonEncode(task.toJson()));
-    } catch (_) {
-      // Ignore disk errors during throttle? or log?
+      try {
+        final file = File('${task.savePath}.meta');
+        file.writeAsStringSync(jsonEncode(task.toJson()));
+      } catch (_) {}
     }
   }
 }

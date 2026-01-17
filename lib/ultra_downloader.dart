@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 import 'dart:isolate';
 
 import 'package:flutter/widgets.dart'; // For WidgetsFlutterBinding
@@ -8,7 +10,12 @@ import 'src/chunk_manager.dart';
 import 'src/downloader_isolate.dart';
 
 export 'src/chunk_manager.dart'
-    show ChunkingStrategy, DownloadStatus, StrategyType, DownloadProgress;
+    show
+        ChunkingStrategy,
+        DownloadStatus,
+        StrategyType,
+        DownloadProgress,
+        AuxiliaryFile;
 
 class UltraDownloader {
   static final UltraDownloader _instance = UltraDownloader._internal();
@@ -28,10 +35,21 @@ class UltraDownloader {
   bool _isInitialized = false;
   bool _debug = false;
 
+  Future<void>? _initFuture;
+
   /// Initialize the downloader. Must be called before use.
   /// Set [debug] to true to enable console logs.
-  Future<void> initialize({bool debug = false}) async {
-    if (_isInitialized) return;
+  Future<void> initialize({bool debug = false}) {
+    if (_isInitialized) return Future.value();
+
+    // Return existing future if initialization is already in progress
+    if (_initFuture != null) return _initFuture!;
+
+    _initFuture = _initializeInternal(debug);
+    return _initFuture!;
+  }
+
+  Future<void> _initializeInternal(bool debug) async {
     _debug = debug;
 
     _receivePort = ReceivePort();
@@ -53,7 +71,8 @@ class UltraDownloader {
         } else if (type == 'progress' || type == 'status') {
           final taskId = message['taskId'] as String;
           final progress = (message['progress'] as num?)?.toDouble() ?? 0.0;
-          final status = DownloadStatus.values[message['status'] as int];
+          final statusIndex = message['status'] as int? ?? 0;
+          final status = DownloadStatus.values[statusIndex];
 
           _statusController.add(DownloadProgress(taskId, progress, status));
         }
@@ -64,11 +83,70 @@ class UltraDownloader {
 
     if (_debug) debugPrint('[UltraDownloader] Initialized');
 
-    // Clean up "stuck" downloads from previous crash
-    // We can ask the isolate to do this, or do it here?
-    // For now, allow isolate to handle resumption via .meta files on its own.
-
     _isInitialized = true;
+  }
+
+  /// Retrieves the current status of a task from disk.
+  /// This is used to recover state when the app restarts.
+  /// It automatically handles:
+  /// 1. Checking if the final file is already completed (priority).
+  /// 2. Parsing the .meta file.
+  /// 3. Verifying partial files for accurate progress.
+  static Future<DownloadTask?> getTaskInfo(String savePath,
+      {String? taskId}) async {
+    try {
+      // 1. Priority Check: Final File Existence
+      final finalFile = File(savePath);
+      if (finalFile.existsSync() && finalFile.lengthSync() > 0) {
+        final size = finalFile.lengthSync();
+        final chunks = [
+          Chunk(id: 0, start: 0, end: size - 1, downloaded: size)
+        ];
+
+        return DownloadTask(
+            id: taskId ?? 'recovered_completed',
+            url: '', // Unknown from just file
+            savePath: savePath,
+            status: DownloadStatus.completed,
+            totalSize: size,
+            chunks: chunks);
+      }
+
+      // 2. Metadata Check
+      final metaFile = File("$savePath.meta");
+      if (!metaFile.existsSync()) {
+        return null; // No record found
+      }
+
+      final jsonString = await metaFile.readAsString();
+      final json = jsonDecode(jsonString);
+
+      final task = DownloadTask.fromJson(json);
+
+      // 3. Status Verification & Partial Scan
+      if (task.status == DownloadStatus.completed) {
+        // Meta says completed, but we didn't find the file above?
+        // This implies the file was deleted or moved.
+        task.status = DownloadStatus.failed;
+        task.errorMessage = "File missing";
+        return task;
+      }
+
+      // If paused/downloading/failed, check partials for precise progress
+      if (task.status != DownloadStatus.completed) {
+        for (var chunk in task.chunks) {
+          final partFile = File("$savePath.part.${chunk.id}");
+          if (partFile.existsSync()) {
+            chunk.downloaded = partFile.lengthSync();
+          }
+        }
+      }
+
+      return task;
+    } catch (e) {
+      debugPrint("[UltraDownloader] Check Info Error: $e");
+      return null;
+    }
   }
 
   /// Starts a new download.
@@ -81,6 +159,7 @@ class UltraDownloader {
     Map<String, dynamic>? headers,
     ChunkingStrategy? strategy,
     String? id,
+    List<AuxiliaryFile>? auxiliaries,
   }) async {
     if (!_isInitialized) await initialize(debug: _debug);
 
@@ -91,6 +170,7 @@ class UltraDownloader {
       savePath: savePath,
       headers: headers,
       strategy: strategy ?? const ChunkingStrategy(),
+      auxiliaries: auxiliaries ?? const [],
     );
 
     _isolateSendPort!.send({
