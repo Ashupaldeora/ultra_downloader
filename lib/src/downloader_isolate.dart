@@ -90,7 +90,7 @@ class _DownloaderIsolate {
         if (task.status == DownloadStatus.completed) {
           // Verify file actually exists
           if (File(task.savePath).existsSync()) {
-            _broadcastStatus(_TaskRuntime(task, _mainSendPort));
+            _broadcastStatus(_TaskRuntime(task, _mainSendPort, _log));
             return;
           }
           // If missing, restart
@@ -106,7 +106,7 @@ class _DownloaderIsolate {
 
     _pausedTasks.remove(task.id);
 
-    final runtime = _TaskRuntime(task, _mainSendPort);
+    final runtime = _TaskRuntime(task, _mainSendPort, _log);
     _activeTasks[task.id] = runtime;
 
     try {
@@ -287,28 +287,60 @@ class _DownloaderIsolate {
   }
 
   void _cancelDownload(String taskId) {
-    final runtime = _activeTasks[taskId];
+    DownloadTask? taskToDelete;
+    _TaskRuntime? runtime = _activeTasks[taskId];
+
     if (runtime != null) {
+      // It's active
+      taskToDelete = runtime.task;
       runtime.task.status = DownloadStatus.canceled;
       runtime.cancelAll();
       _activeTasks.remove(taskId);
       runtime.closeAllFiles();
 
-      // Cleanup Partials
+      // Cleanup Partials for active task
       for (var chunk in runtime.task.chunks) {
         try {
           File(runtime.getPartPath(chunk)).deleteSync();
         } catch (_) {}
       }
-      try {
-        File(runtime.task.savePath).deleteSync();
-      } catch (_) {}
+    } else {
+      // Check if it's paused
+      taskToDelete = _pausedTasks[taskId];
+      _pausedTasks.remove(taskId);
     }
-    _pausedTasks.remove(taskId);
 
-    // Also try to cleanup if it was just paused
-    // Note: We need the savePath to cleanup properly.
-    // If it's in pausedTasks, we have it.
+    // Common Cleanup Logic
+    if (taskToDelete != null) {
+      // Delete Main File (if exists)
+      try {
+        final mainFile = File(taskToDelete.savePath);
+        if (mainFile.existsSync()) mainFile.deleteSync();
+        _log("Main file deleted: ${taskToDelete.savePath}");
+      } catch (e) {
+        _log("Failed to delete main file: $e");
+      }
+
+      // Delete Meta File
+      try {
+        final metaFile = File('${taskToDelete.savePath}.meta');
+        if (metaFile.existsSync()) metaFile.deleteSync();
+        _log("Meta file deleted for task: ${taskToDelete.id}");
+      } catch (e) {
+        _log("Failed to delete meta file: $e");
+      }
+
+      // Delete Partials
+      for (var chunk in taskToDelete.chunks) {
+        try {
+          final partFile = File('${taskToDelete.savePath}.part.${chunk.id}');
+          if (partFile.existsSync()) partFile.deleteSync();
+        } catch (e) {
+          _log("Failed to delete partial file for chunk ${chunk.id}: $e");
+        }
+      }
+      _log("Partial files cleaned up for task: ${taskToDelete.id}");
+    }
 
     _mainSendPort.send({
       'type': 'status',
@@ -327,11 +359,32 @@ class _DownloaderIsolate {
 
       for (var chunk in runtime.task.chunks) {
         final partFile = File(runtime.getPartPath(chunk));
-        if (partFile.existsSync()) {
-          await sink.addStream(partFile.openRead());
-          await partFile.delete(); // Cleanup part on success
-        } else {
+        if (!partFile.existsSync()) {
           throw Exception("Missing part file for chunk ${chunk.id}");
+        }
+
+        // Critical Size Check before Merge
+        final partLen = partFile.lengthSync();
+        final expectedLen = chunk.end - chunk.start + 1;
+        // The last chunk might be smaller or exactly the size, but never larger.
+        // Actually, for the last chunk, end is totalSize-1. So (end - start + 1) IS the expected size.
+        // If the server doesn't support range requests correctly, we might get full file?
+        // But here we assume we got ranges.
+
+        if (partLen != expectedLen) {
+          throw Exception(
+              "Chunk ${chunk.id} size deviation! Expected $expectedLen, got $partLen. Aborting merge to prevent corruption.");
+        }
+
+        await sink.addStream(partFile.openRead());
+      }
+
+      // Delete parts only after all have been successfully written to the stream
+      for (var chunk in runtime.task.chunks) {
+        try {
+          File(runtime.getPartPath(chunk)).deleteSync();
+        } catch (e) {
+          _log("Failed to delete merged part file ${chunk.id}: $e");
         }
       }
 
@@ -365,7 +418,9 @@ class _DownloaderIsolate {
     try {
       final file = File('${task.savePath}.meta');
       file.writeAsStringSync(jsonEncode(task.toJson()));
-    } catch (_) {}
+    } catch (e) {
+      _log("Failed to save metadata: $e");
+    }
   }
 
   void _broadcastStatus(_TaskRuntime runtime) {
@@ -426,7 +481,9 @@ class _TaskRuntime {
   bool isCancelled = false;
   final List<ChunkStreamSubscription> literals = [];
 
-  _TaskRuntime(this.task, this.port);
+  final void Function(String) logger;
+
+  _TaskRuntime(this.task, this.port, this.logger);
 
   Future<void> initialize() async {}
 
@@ -437,13 +494,32 @@ class _TaskRuntime {
       final file = File(getPartPath(chunk));
       if (file.existsSync()) {
         final len = file.lengthSync();
-        // If file is larger than chunk size, it's corrupt/overwritten? Clip it?
-        // ideally downloaded = len.
-        chunk.downloaded = len;
-        if (chunk.downloaded > (chunk.end - chunk.start + 1)) {
-          // Overshot? Truncate.
-          chunk.downloaded = (chunk.end - chunk.start + 1);
-          // We should truncate the file too?
+        final expectedChunkSize = chunk.end - chunk.start + 1;
+
+        if (len > expectedChunkSize) {
+          // If the file is larger than expected (overshot), it must be truncated to prevent corruption.
+          // This can occur if a previous download attempt wrote more data than intended before a crash.
+          try {
+            final raf = file.openSync(mode: FileMode.append);
+            raf.truncateSync(expectedChunkSize);
+            raf.closeSync();
+            chunk.downloaded = expectedChunkSize;
+            logger(
+                "Info: Truncated overshot chunk ${chunk.id}. Size adjusted: $len -> $expectedChunkSize");
+          } catch (e) {
+            logger("Error: Failed to truncate chunk ${chunk.id}: $e");
+
+            // If truncation fails, the chunk is corrupt and cannot be recovered.
+            // Delete the chunk and reset progress to 0 to force a redownload.
+            try {
+              file.deleteSync();
+            } catch (deleteError) {
+              logger("Failed to delete corrupt chunk file: $deleteError");
+            }
+            chunk.downloaded = 0;
+          }
+        } else {
+          chunk.downloaded = len;
         }
       } else {
         chunk.downloaded = 0;
@@ -469,7 +545,9 @@ class _TaskRuntime {
     for (var raf in _openFiles.values) {
       try {
         raf.closeSync();
-      } catch (_) {}
+      } catch (e) {
+        logger("Failed to close file for chunk ${raf.path}: $e");
+      }
     }
     _openFiles.clear();
   }
@@ -533,7 +611,9 @@ class _TaskRuntime {
       try {
         final file = File('${task.savePath}.meta');
         file.writeAsStringSync(jsonEncode(task.toJson()));
-      } catch (_) {}
+      } catch (e) {
+        logger("Failed to auto-save metadata: $e");
+      }
     }
   }
 }

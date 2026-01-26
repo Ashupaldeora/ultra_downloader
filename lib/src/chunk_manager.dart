@@ -210,7 +210,7 @@ class ChunkManager {
         } else if (totalSize < 500 * 1024 * 1024) {
           count = 8; // 100MB - 500MB
         } else {
-          count = 16; // > 500MB
+          count = 12; // > 500MB
         }
         break;
     }
