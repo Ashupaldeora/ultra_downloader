@@ -1,3 +1,23 @@
+// =============================================================================
+// ULTRA DOWNLOADER - Isolate-based Download Engine
+// =============================================================================
+//
+// This file contains the core download logic running in a separate isolate.
+// It handles chunked downloads, pause/resume, and file merging.
+//
+// ARCHITECTURE:
+// - Main isolate sends commands (download, pause, resume, cancel)
+// - This isolate processes commands and streams progress back
+// - File I/O is buffered for performance but ALWAYS flushed before state changes
+//
+// CRITICAL: All buffer flushes MUST complete before:
+// 1. Checking chunk completion status
+// 2. Pausing/canceling downloads
+// 3. Closing file handles
+// 4. Merging part files
+//
+// =============================================================================
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -11,33 +31,42 @@ import 'package:dio/dio.dart';
 import 'chunk_manager.dart';
 
 /// Entry point for the downloader isolate.
+/// Spawned by UltraDownloader.initialize() in the main isolate.
 void downloadIsolateEntry(SendPort sendPort) {
   final isolate = _DownloaderIsolate(sendPort);
   isolate.listen();
 }
 
+// =============================================================================
+// _DownloaderIsolate - Core Download Controller
+// =============================================================================
+
 class _DownloaderIsolate {
   final SendPort _mainSendPort;
   final ReceivePort _isolateReceivePort = ReceivePort();
 
-  // Active tasks: taskId -> _TaskRuntime
+  /// Active downloads: taskId -> runtime state
   final Map<String, _TaskRuntime> _activeTasks = {};
 
-  // Paused tasks: taskId -> DownloadTask (kept in memory to allow resume by ID)
+  /// Paused downloads: taskId -> task metadata (kept for resume by ID)
   final Map<String, DownloadTask> _pausedTasks = {};
+
   final Dio _dio = Dio();
 
   _DownloaderIsolate(this._mainSendPort) {
+    // Reasonable timeouts to prevent hung connections
     _dio.options.connectTimeout = const Duration(seconds: 30);
     _dio.options.receiveTimeout = const Duration(seconds: 30);
   }
 
+  /// Sends a log message to the main isolate for debug output.
   void _log(String msg) {
     _mainSendPort.send({'type': 'log', 'msg': msg});
   }
 
+  /// Starts listening for commands from the main isolate.
   void listen() {
-    // Handshake: Send our ReceivePort to the main isolate
+    // Handshake: Send our ReceivePort to enable bidirectional communication
     _mainSendPort.send(_isolateReceivePort.sendPort);
 
     _isolateReceivePort.listen((message) {
@@ -64,18 +93,36 @@ class _DownloaderIsolate {
     });
   }
 
+  // ===========================================================================
+  // DOWNLOAD LIFECYCLE
+  // ===========================================================================
+
+  /// Initiates or resumes a download task.
+  ///
+  /// This method handles:
+  /// 1. Parsing task metadata
+  /// 2. Recovering from previous state (if .meta file exists)
+  /// 3. Fetching content length and calculating chunks
+  /// 4. Verifying partial files for accurate resume
+  /// 5. Downloading auxiliary files (subtitles, etc.)
+  /// 6. Firing parallel chunk downloads
+  /// 7. Merging chunks into final file
   Future<void> _startDownload(Map<String, dynamic> taskJson) async {
-    // 1. Initial Task Parsing
+    // -------------------------------------------------------------------------
+    // PHASE 1: Initial Task Parsing
+    // -------------------------------------------------------------------------
     var task = DownloadTask.fromJson(taskJson);
 
-    // 2. Recovery Logic (Metadata Check)
+    // -------------------------------------------------------------------------
+    // PHASE 2: Recovery Logic - Check for existing metadata
+    // -------------------------------------------------------------------------
     final metaFile = File('${task.savePath}.meta');
     if (metaFile.existsSync()) {
       try {
         final json = jsonDecode(metaFile.readAsStringSync());
         final oldTask = DownloadTask.fromJson(json);
 
-        // Use the NEW ID passed from UI, but keep old state
+        // Preserve the NEW task ID from UI, but restore previous state
         task = DownloadTask(
             id: taskJson['id'],
             url: task.url,
@@ -84,16 +131,19 @@ class _DownloaderIsolate {
             strategy: task.strategy,
             totalSize: oldTask.totalSize,
             chunks: oldTask.chunks,
+            auxiliaries: oldTask.auxiliaries,
             status: oldTask.status,
             errorMessage: oldTask.errorMessage);
 
+        // If metadata says completed, verify the file actually exists
         if (task.status == DownloadStatus.completed) {
-          // Verify file actually exists
           if (File(task.savePath).existsSync()) {
             _broadcastStatus(_TaskRuntime(task, _mainSendPort, _log));
-            return;
+            return; // Already done, nothing to do
           }
-          // If missing, restart
+          // File missing despite "completed" status - restart from scratch
+          _log(
+              "Warning: Metadata says completed but file missing. Restarting.");
           task.status = DownloadStatus.queued;
           task.chunks = [];
         }
@@ -102,8 +152,10 @@ class _DownloaderIsolate {
       }
     }
 
+    // Prevent duplicate downloads of the same task
     if (_activeTasks.containsKey(task.id)) return;
 
+    // Remove from paused queue (if was paused)
     _pausedTasks.remove(task.id);
 
     final runtime = _TaskRuntime(task, _mainSendPort, _log);
@@ -112,7 +164,9 @@ class _DownloaderIsolate {
     try {
       await runtime.initialize();
 
-      // 3. Size & Chunk Calculation (if new)
+      // -----------------------------------------------------------------------
+      // PHASE 3: Size & Chunk Calculation (only for new downloads)
+      // -----------------------------------------------------------------------
       if (runtime.task.totalSize == 0 || runtime.task.chunks.isEmpty) {
         final totalSize = await _getContentLength(task.url, task.headers);
         runtime.task.totalSize = totalSize;
@@ -121,15 +175,20 @@ class _DownloaderIsolate {
         _saveMetadata(runtime.task);
       }
 
-      // 4. Smart Resume (Partial Files Scan)
-      // This updates chunk.downloaded based on actual disk usage
+      // -----------------------------------------------------------------------
+      // PHASE 4: Smart Resume - Verify partial files on disk
+      // This updates chunk.downloaded based on actual file sizes
+      // -----------------------------------------------------------------------
       await runtime.verifyPartialFiles();
 
       runtime.task.status = DownloadStatus.downloading;
       _saveMetadata(runtime.task);
       _broadcastStatus(runtime);
 
-      // --- Processing Auxiliaries (Parallel Best Effort) ---
+      // -----------------------------------------------------------------------
+      // PHASE 5: Process Auxiliary Files (parallel, best-effort)
+      // These are small files like subtitles that should exist with the video
+      // -----------------------------------------------------------------------
       if (runtime.task.auxiliaries.isNotEmpty) {
         final pendingAux =
             runtime.task.auxiliaries.where((a) => !a.isCompleted).toList();
@@ -139,17 +198,19 @@ class _DownloaderIsolate {
             if (runtime.isCancelled) return;
             try {
               await _downloadAuxiliary(runtime, aux);
-              aux.isCompleted = true; // Mark done
-              _saveMetadata(runtime.task); // Checkpoint
+              aux.isCompleted = true;
+              _saveMetadata(runtime.task); // Checkpoint progress
             } catch (e) {
               _log("⚠️ Auxiliary failed (ignoring): ${aux.url} -> $e");
-              // Proceed despite error (Best Effort)
+              // Best effort - don't fail main download for subtitle errors
             }
           }));
         }
       }
 
-      // 5. Fire Requests
+      // -----------------------------------------------------------------------
+      // PHASE 6: Fire Parallel Chunk Downloads
+      // -----------------------------------------------------------------------
       List<Future> futures = [];
       bool allCompleted = true;
 
@@ -162,14 +223,27 @@ class _DownloaderIsolate {
         }
       }
 
+      // All chunks were already complete (recovered from pause near 100%)
       if (allCompleted) {
         await _completeTask(runtime);
         return;
       }
 
+      // Wait for all chunk downloads to complete (or error)
       await Future.wait(futures);
 
-      // Final verification
+      // -----------------------------------------------------------------------
+      // PHASE 7: CRITICAL - Flush ALL buffers before checking completion
+      // -----------------------------------------------------------------------
+      // This is essential! Each chunk stream calls flush() in its onDone,
+      // but we must ensure ALL data is written to disk before we check
+      // whether chunks are complete. Without this, small files or the last
+      // few KB of any download can be lost.
+      runtime.flushAllBuffers();
+
+      // -----------------------------------------------------------------------
+      // PHASE 8: Final Verification & Merge
+      // -----------------------------------------------------------------------
       if (runtime.task.chunks.every((c) => c.isCompleted) &&
           !runtime.isCancelled) {
         await _completeTask(runtime);
@@ -178,6 +252,7 @@ class _DownloaderIsolate {
       if (runtime.isCancelled) return;
       _handleError(runtime, e, st);
     } finally {
+      // Cleanup: Remove from active tasks if not still downloading
       if (runtime.task.status != DownloadStatus.downloading) {
         _activeTasks.remove(task.id);
         runtime.closeAllFiles();
@@ -185,6 +260,11 @@ class _DownloaderIsolate {
     }
   }
 
+  /// Downloads a single chunk using HTTP Range requests.
+  ///
+  /// Implements exponential backoff retry logic for transient failures.
+  /// Data is buffered in memory (up to 1MB) before flushing to disk
+  /// for performance optimization.
   Future<void> _downloadChunk(_TaskRuntime runtime, Chunk chunk) async {
     if (runtime.isCancelled) return;
 
@@ -193,9 +273,11 @@ class _DownloaderIsolate {
 
     while (retryCount < maxRetries && !runtime.isCancelled) {
       try {
+        // Calculate byte range: resume from where we left off
         final start = chunk.start + chunk.downloaded;
         final end = chunk.end;
 
+        // Already completed (can happen after verify + resume)
         if (start > end) return;
 
         final headers = Map<String, dynamic>.from(runtime.task.headers ?? {});
@@ -222,6 +304,7 @@ class _DownloaderIsolate {
             runtime.write(chunk, data);
           },
           onDone: () {
+            // CRITICAL: Flush remaining buffer when stream completes
             runtime.flush(chunk);
             completer.complete();
           },
@@ -234,15 +317,18 @@ class _DownloaderIsolate {
         runtime.literals.add(subscription);
         await completer.future;
         runtime.literals.remove(subscription);
-        return;
+        return; // Success - exit retry loop
       } on DioException catch (e) {
-        if (e.type == DioExceptionType.cancel || CancelToken.isCancel(e))
-          return;
+        if (e.type == DioExceptionType.cancel || CancelToken.isCancel(e)) {
+          return; // Intentional cancellation, not an error
+        }
 
         retryCount++;
         if (retryCount >= maxRetries) rethrow;
 
+        // Exponential backoff: 2s, 4s, 8s, 16s, 32s
         int delay = pow(2, retryCount).toInt() * 1000;
+        _log("Chunk ${chunk.id} retry $retryCount after ${delay}ms");
         await Future.delayed(Duration(milliseconds: delay));
       } catch (e) {
         retryCount++;
@@ -252,67 +338,89 @@ class _DownloaderIsolate {
     }
   }
 
+  /// Fetches the content length of a URL via HEAD request.
   Future<int> _getContentLength(
       String url, Map<String, dynamic>? headers) async {
     try {
       final response = await _dio.head(url, options: Options(headers: headers));
       final lenStr = response.headers.value('content-length');
       if (lenStr != null) return int.parse(lenStr);
-      throw Exception('Could not determine content length');
+      throw Exception('Server did not provide content-length header');
     } catch (e) {
-      throw Exception('Failed to head url: $e');
+      throw Exception('Failed to get content length: $e');
     }
   }
 
+  // ===========================================================================
+  // PAUSE / RESUME / CANCEL
+  // ===========================================================================
+
+  /// Pauses an active download.
+  ///
+  /// CRITICAL: We must flush all buffered data BEFORE marking as paused,
+  /// otherwise data in memory will be lost and the resumed download will
+  /// have gaps (causing corruption).
   void _pauseDownload(String taskId) {
     final runtime = _activeTasks[taskId];
-    if (runtime != null) {
-      runtime.task.status = DownloadStatus.paused;
-      runtime.cancelAll();
-      _saveMetadata(runtime.task);
-      _broadcastStatus(runtime);
-      _activeTasks.remove(taskId);
-      _pausedTasks[taskId] = runtime.task;
-      runtime.closeAllFiles();
-    }
+    if (runtime == null) return;
+
+    // Step 1: FLUSH ALL BUFFERS FIRST - This is critical!
+    // Data in BytesBuilder must be written to disk before we close handles.
+    runtime.flushAllBuffers();
+
+    // Step 2: Now safe to mark as paused and cancel network operations
+    runtime.task.status = DownloadStatus.paused;
+    runtime.cancelAll();
+
+    // Step 3: Save metadata with accurate progress (post-flush)
+    _saveMetadata(runtime.task);
+    _broadcastStatus(runtime);
+
+    // Step 4: Cleanup - close file handles and move to paused queue
+    _activeTasks.remove(taskId);
+    _pausedTasks[taskId] = runtime.task;
+    runtime.closeAllFiles();
   }
 
+  /// Resumes a paused download.
   void _resumeDownload(String taskId) {
     if (_pausedTasks.containsKey(taskId)) {
       final task = _pausedTasks[taskId]!;
       _startDownload(task.toJson());
-    } else {
-      // Cannot resume if not active or paused (needs path from caller)
     }
+    // If not in paused queue, caller needs to provide full task info
   }
 
+  /// Cancels a download and cleans up all associated files.
   void _cancelDownload(String taskId) {
     DownloadTask? taskToDelete;
     _TaskRuntime? runtime = _activeTasks[taskId];
 
     if (runtime != null) {
-      // It's active
+      // Active download - flush buffers before cleanup to ensure accurate state
+      runtime.flushAllBuffers();
+
       taskToDelete = runtime.task;
       runtime.task.status = DownloadStatus.canceled;
       runtime.cancelAll();
       _activeTasks.remove(taskId);
       runtime.closeAllFiles();
 
-      // Cleanup Partials for active task
+      // Delete partial files for active task
       for (var chunk in runtime.task.chunks) {
         try {
           File(runtime.getPartPath(chunk)).deleteSync();
         } catch (_) {}
       }
     } else {
-      // Check if it's paused
+      // Check paused queue
       taskToDelete = _pausedTasks[taskId];
       _pausedTasks.remove(taskId);
     }
 
-    // Common Cleanup Logic
+    // Common cleanup: delete main file, meta file, and any remaining partials
     if (taskToDelete != null) {
-      // Delete Main File (if exists)
+      // Delete main file (if exists)
       try {
         final mainFile = File(taskToDelete.savePath);
         if (mainFile.existsSync()) mainFile.deleteSync();
@@ -321,7 +429,7 @@ class _DownloaderIsolate {
         _log("Failed to delete main file: $e");
       }
 
-      // Delete Meta File
+      // Delete metadata file
       try {
         final metaFile = File('${taskToDelete.savePath}.meta');
         if (metaFile.existsSync()) metaFile.deleteSync();
@@ -330,7 +438,7 @@ class _DownloaderIsolate {
         _log("Failed to delete meta file: $e");
       }
 
-      // Delete Partials
+      // Delete any remaining partial files
       for (var chunk in taskToDelete.chunks) {
         try {
           final partFile = File('${taskToDelete.savePath}.part.${chunk.id}');
@@ -339,7 +447,7 @@ class _DownloaderIsolate {
           _log("Failed to delete partial file for chunk ${chunk.id}: $e");
         }
       }
-      _log("Partial files cleaned up for task: ${taskToDelete.id}");
+      _log("Cleanup completed for task: ${taskToDelete.id}");
     }
 
     _mainSendPort.send({
@@ -349,9 +457,45 @@ class _DownloaderIsolate {
     });
   }
 
+  // ===========================================================================
+  // COMPLETION & MERGE
+  // ===========================================================================
+
+  /// Merges all chunk part files into the final destination file.
+  ///
+  /// CRITICAL: All file handles must be closed BEFORE reading part files.
+  /// This ensures the OS file system cache is flushed and we read complete data.
   Future<void> _completeTask(_TaskRuntime runtime) async {
-    // MERGE LOGIC
     try {
+      // -----------------------------------------------------------------------
+      // STEP 1: Close all file handles FIRST
+      // This ensures all buffered data is flushed to the OS and files are
+      // readable by other handles. Without this, we might read stale data.
+      // -----------------------------------------------------------------------
+      runtime.closeAllFiles();
+
+      // -----------------------------------------------------------------------
+      // STEP 2: Verify all chunks are present and correctly sized
+      // -----------------------------------------------------------------------
+      for (var chunk in runtime.task.chunks) {
+        final partFile = File(runtime.getPartPath(chunk));
+        if (!partFile.existsSync()) {
+          throw Exception("Missing part file for chunk ${chunk.id}");
+        }
+
+        final partLen = partFile.lengthSync();
+        final expectedLen = chunk.end - chunk.start + 1;
+
+        if (partLen != expectedLen) {
+          throw Exception(
+              "Chunk ${chunk.id} size mismatch! Expected $expectedLen bytes, "
+              "got $partLen bytes. Aborting merge to prevent corruption.");
+        }
+      }
+
+      // -----------------------------------------------------------------------
+      // STEP 3: Merge all parts into destination file
+      // -----------------------------------------------------------------------
       final destination = File(runtime.task.savePath);
       if (destination.existsSync()) destination.deleteSync();
 
@@ -359,54 +503,46 @@ class _DownloaderIsolate {
 
       for (var chunk in runtime.task.chunks) {
         final partFile = File(runtime.getPartPath(chunk));
-        if (!partFile.existsSync()) {
-          throw Exception("Missing part file for chunk ${chunk.id}");
-        }
-
-        // Critical Size Check before Merge
-        final partLen = partFile.lengthSync();
-        final expectedLen = chunk.end - chunk.start + 1;
-        // The last chunk might be smaller or exactly the size, but never larger.
-        // Actually, for the last chunk, end is totalSize-1. So (end - start + 1) IS the expected size.
-        // If the server doesn't support range requests correctly, we might get full file?
-        // But here we assume we got ranges.
-
-        if (partLen != expectedLen) {
-          throw Exception(
-              "Chunk ${chunk.id} size deviation! Expected $expectedLen, got $partLen. Aborting merge to prevent corruption.");
-        }
-
         await sink.addStream(partFile.openRead());
       }
 
-      // Delete parts only after all have been successfully written to the stream
+      // Ensure all data is written to disk
+      await sink.flush();
+      await sink.close();
+
+      // -----------------------------------------------------------------------
+      // STEP 4: Cleanup part files only after successful merge
+      // -----------------------------------------------------------------------
       for (var chunk in runtime.task.chunks) {
         try {
           File(runtime.getPartPath(chunk)).deleteSync();
         } catch (e) {
-          _log("Failed to delete merged part file ${chunk.id}: $e");
+          _log("Warning: Failed to delete merged part file ${chunk.id}: $e");
         }
       }
 
-      await sink.flush();
-      await sink.close();
-
+      // -----------------------------------------------------------------------
+      // STEP 5: Update status and notify
+      // -----------------------------------------------------------------------
       runtime.task.status = DownloadStatus.completed;
-      // We keep metadata for existence checks, but maybe clear progress details?
-      // Keeping identical to previous logic:
       _saveMetadata(runtime.task);
       _broadcastStatus(runtime);
       _activeTasks.remove(runtime.task.id);
       _pausedTasks.remove(runtime.task.id);
-      runtime.closeAllFiles();
     } catch (e, st) {
       _handleError(runtime, e, st);
     }
   }
 
+  // ===========================================================================
+  // ERROR HANDLING & UTILITIES
+  // ===========================================================================
+
+  /// Handles download errors by updating status and notifying listeners.
   void _handleError(_TaskRuntime runtime, Object e, StackTrace st) {
     runtime.task.status = DownloadStatus.failed;
     runtime.task.errorMessage = e.toString();
+    _log("Download failed: $e\n$st");
     _saveMetadata(runtime.task);
     _broadcastStatus(runtime);
     _activeTasks.remove(runtime.task.id);
@@ -414,6 +550,7 @@ class _DownloaderIsolate {
     runtime.closeAllFiles();
   }
 
+  /// Persists task metadata to disk for recovery after app restart.
   void _saveMetadata(DownloadTask task) {
     try {
       final file = File('${task.savePath}.meta');
@@ -423,26 +560,27 @@ class _DownloaderIsolate {
     }
   }
 
+  /// Broadcasts progress/status update to main isolate and any registered monitors.
   void _broadcastStatus(_TaskRuntime runtime) {
-    _mainSendPort.send({
+    final payload = {
       'type': 'progress',
       'taskId': runtime.task.id,
       'progress': runtime.task.progress,
       'status': runtime.task.status.index
-    });
+    };
 
+    _mainSendPort.send(payload);
+
+    // Also notify any registered background monitors (e.g., for notifications)
     final monitorPort =
         IsolateNameServer.lookupPortByName('ultra_downloader_monitor_port');
     if (monitorPort != null) {
-      monitorPort.send({
-        'type': 'progress',
-        'taskId': runtime.task.id,
-        'progress': runtime.task.progress,
-        'status': runtime.task.status.index
-      });
+      monitorPort.send(payload);
     }
   }
 
+  /// Downloads a small auxiliary file (e.g., subtitle, poster).
+  /// Uses simple download (not chunked) with retry logic.
   Future<void> _downloadAuxiliary(
       _TaskRuntime runtime, AuxiliaryFile aux) async {
     int retries = 3;
@@ -464,31 +602,63 @@ class _DownloaderIsolate {
   }
 }
 
+// =============================================================================
+// Helper Classes
+// =============================================================================
+
+/// Wrapper for stream subscription to enable cancellation management.
 class ChunkStreamSubscription {
   final StreamSubscription _sub;
   ChunkStreamSubscription(this._sub);
   void cancel() => _sub.cancel();
 }
 
+// =============================================================================
+// _TaskRuntime - Per-Download State Manager
+// =============================================================================
+//
+// Manages the runtime state of a single download task including:
+// - File handles for each chunk's part file
+// - Memory buffers for write optimization
+// - Cancellation state
+// - Progress tracking
+//
+// BUFFER STRATEGY:
+// Data received from the network is accumulated in BytesBuilder buffers.
+// When a buffer reaches 1MB, it's flushed to disk. This reduces I/O syscalls.
+// CRITICAL: All buffers MUST be flushed before checking completion or pausing!
+//
+// =============================================================================
+
 class _TaskRuntime {
   final DownloadTask task;
   final SendPort port;
   final CancelToken cancelToken = CancelToken();
 
-  // Map chunk ID to its open file handle
+  /// Open file handles: chunk ID -> RandomAccessFile
   final Map<int, RandomAccessFile> _openFiles = {};
 
+  /// Cancellation flag - checked throughout the download process
   bool isCancelled = false;
+
+  /// Active stream subscriptions (for cancellation)
   final List<ChunkStreamSubscription> literals = [];
 
+  /// Logger function passed from isolate
   final void Function(String) logger;
 
   _TaskRuntime(this.task, this.port, this.logger);
 
   Future<void> initialize() async {}
 
+  /// Returns the path to a chunk's partial file.
   String getPartPath(Chunk chunk) => '${task.savePath}.part.${chunk.id}';
 
+  /// Verifies partial files on disk and updates chunk.downloaded accordingly.
+  ///
+  /// This is essential for accurate resume. If a partial file is larger than
+  /// expected (overshot due to previous bug), it's truncated. If smaller,
+  /// we use the actual size for accurate progress.
   Future<void> verifyPartialFiles() async {
     for (var chunk in task.chunks) {
       final file = File(getPartPath(chunk));
@@ -497,8 +667,9 @@ class _TaskRuntime {
         final expectedChunkSize = chunk.end - chunk.start + 1;
 
         if (len > expectedChunkSize) {
-          // If the file is larger than expected (overshot), it must be truncated to prevent corruption.
-          // This can occur if a previous download attempt wrote more data than intended before a crash.
+          // OVERSHOT RECOVERY: File is larger than expected, truncate it.
+          // This can occur if a previous download wrote more data than intended
+          // before a crash or if there was a bug in buffer management.
           try {
             final raf = file.openSync(mode: FileMode.append);
             raf.truncateSync(expectedChunkSize);
@@ -508,9 +679,8 @@ class _TaskRuntime {
                 "Info: Truncated overshot chunk ${chunk.id}. Size adjusted: $len -> $expectedChunkSize");
           } catch (e) {
             logger("Error: Failed to truncate chunk ${chunk.id}: $e");
-
-            // If truncation fails, the chunk is corrupt and cannot be recovered.
-            // Delete the chunk and reset progress to 0 to force a redownload.
+            // If truncation fails, the chunk is corrupt and unrecoverable.
+            // Delete it and reset progress to force redownload.
             try {
               file.deleteSync();
             } catch (deleteError) {
@@ -519,6 +689,7 @@ class _TaskRuntime {
             chunk.downloaded = 0;
           }
         } else {
+          // Normal case: use actual file size
           chunk.downloaded = len;
         }
       } else {
@@ -527,6 +698,7 @@ class _TaskRuntime {
     }
   }
 
+  /// Opens a chunk's partial file for appending.
   Future<void> openChunkFile(Chunk chunk) async {
     if (_openFiles.containsKey(chunk.id)) return;
 
@@ -535,23 +707,26 @@ class _TaskRuntime {
       fileObj.createSync(recursive: true);
     }
 
-    // IMPORTANT: We use append mode so we continue where we left off.
-    // verifyPartialFiles() ensures 'downloaded' matches file length.
+    // APPEND mode: continue writing where we left off
+    // verifyPartialFiles() ensures 'downloaded' matches actual file length
     final raf = await fileObj.open(mode: FileMode.append);
     _openFiles[chunk.id] = raf;
   }
 
+  /// Closes all open file handles.
+  /// MUST be called before reading files for merge, or on cleanup.
   void closeAllFiles() {
-    for (var raf in _openFiles.values) {
+    for (var entry in _openFiles.entries) {
       try {
-        raf.closeSync();
+        entry.value.closeSync();
       } catch (e) {
-        logger("Failed to close file for chunk ${raf.path}: $e");
+        logger("Failed to close file for chunk ${entry.key}: $e");
       }
     }
     _openFiles.clear();
   }
 
+  /// Cancels all active operations (network requests and stream subscriptions).
   void cancelAll() {
     isCancelled = true;
     cancelToken.cancel();
@@ -561,27 +736,48 @@ class _TaskRuntime {
     literals.clear();
   }
 
+  // ---------------------------------------------------------------------------
+  // BUFFERED WRITE SYSTEM
+  // ---------------------------------------------------------------------------
+  //
+  // For performance, we buffer incoming data in memory (BytesBuilder) and
+  // flush to disk when the buffer reaches 1MB. This significantly reduces
+  // I/O syscalls compared to writing every packet immediately.
+  //
+  // CRITICAL: The flushAllBuffers() method MUST be called:
+  // 1. Before checking chunk completion (data might still be in buffer)
+  // 2. Before pausing (so progress is accurately recorded)
+  // 3. Before closing file handles
+  //
+  // ---------------------------------------------------------------------------
+
   int _lastUpdate = 0;
   int _lastSave = 0;
 
+  /// Per-chunk memory buffers
   final Map<Chunk, BytesBuilder> _buffers = {};
 
+  /// Adds data to a chunk's buffer. Flushes to disk when buffer reaches 1MB.
   void write(Chunk chunk, List<int> data) {
     if (isCancelled) return;
     _buffers.putIfAbsent(chunk, () => BytesBuilder(copy: false)).add(data);
     if (_buffers[chunk]!.length >= 1024 * 1024) {
-      // 1MB Buffer
+      // 1MB threshold reached - flush to disk
       flush(chunk);
     }
   }
 
+  /// Flushes a single chunk's buffer to disk.
   void flush(Chunk chunk) {
-    if (isCancelled) return;
+    // NOTE: We intentionally DON'T check isCancelled here!
+    // Even if cancelled, we must flush to preserve accurate progress.
+    // The data is already received - discarding it would cause corruption on resume.
+
     final buffer = _buffers[chunk];
     if (buffer == null || buffer.isEmpty) return;
 
     final raf = _openFiles[chunk.id];
-    if (raf == null) return; // Should have been opened
+    if (raf == null) return; // File should have been opened
 
     final data = buffer.takeBytes();
     try {
@@ -589,13 +785,26 @@ class _TaskRuntime {
       chunk.downloaded += data.length;
       _checkProgress();
     } catch (e) {
+      logger("Error writing to chunk ${chunk.id}: $e");
       isCancelled = true;
-      // report error
+      // Error will be handled by the stream's onError
     }
   }
 
+  /// Flushes ALL chunk buffers to disk.
+  /// CRITICAL: Must be called before completion check or pause/cancel!
+  void flushAllBuffers() {
+    for (var chunk in task.chunks) {
+      flush(chunk);
+    }
+  }
+
+  /// Throttled progress update - broadcasts every 500ms max.
+  /// Also auto-saves metadata every 2 seconds.
   void _checkProgress() {
     final now = DateTime.now().millisecondsSinceEpoch;
+
+    // Broadcast progress (throttled to every 500ms)
     if (now - _lastUpdate > 500) {
       _lastUpdate = now;
       port.send({
@@ -606,6 +815,7 @@ class _TaskRuntime {
       });
     }
 
+    // Auto-save metadata (throttled to every 2 seconds)
     if (now - _lastSave > 2000) {
       _lastSave = now;
       try {

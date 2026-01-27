@@ -189,6 +189,16 @@ class AuxiliaryFile {
 
 /// Logic for calculating chunks.
 class ChunkManager {
+  /// Calculates download chunks based on file size and strategy.
+  ///
+  /// Returns a list of contiguous, non-overlapping chunks that cover
+  /// the entire file. Each chunk has a start (inclusive) and end (inclusive)
+  /// byte position.
+  ///
+  /// IMPORTANT: Chunks MUST be contiguous with no gaps or overlaps:
+  /// - chunk[i].end + 1 == chunk[i+1].start (for all i < count-1)
+  /// - chunk[0].start == 0
+  /// - chunk[last].end == totalSize - 1
   static List<Chunk> calculateChunks(int totalSize, ChunkingStrategy strategy) {
     int count = 1;
 
@@ -202,33 +212,44 @@ class ChunkManager {
         }
         break;
       case StrategyType.auto:
-        // Ultra Downloader Smart Logic
+        // Ultra Downloader Smart Logic - optimizes parallel connections
+        // based on file size to balance throughput vs overhead
         if (totalSize < 20 * 1024 * 1024) {
-          count = 1; // < 20MB
+          count = 1; // < 20MB: single connection (overhead > benefit)
         } else if (totalSize < 100 * 1024 * 1024) {
-          count = 4; // 20MB - 100MB
+          count = 4; // 20MB - 100MB: 4 parallel chunks
         } else if (totalSize < 500 * 1024 * 1024) {
-          count = 8; // 100MB - 500MB
+          count = 8; // 100MB - 500MB: 8 parallel chunks
         } else {
-          count = 12; // > 500MB
+          count = 12; // > 500MB: 12 parallel chunks
         }
         break;
     }
 
-    // Safety cap
+    // Safety cap: too many chunks creates excessive overhead
     if (count > 32) count = 32;
 
+    // Ensure we don't have more chunks than bytes
+    if (count > totalSize) count = totalSize;
+
     List<Chunk> chunks = [];
-    int chunkSize = (totalSize / count).ceil();
+
+    // Integer division: base size per chunk
+    int baseChunkSize = totalSize ~/ count;
+    // Remainder bytes to distribute among first N chunks
+    int remainder = totalSize % count;
+
+    int currentStart = 0;
 
     for (int i = 0; i < count; i++) {
-      int start = i * chunkSize;
-      int end = start + chunkSize - 1;
-      if (i == count - 1) {
-        end = totalSize - 1; // Ensure last chunk covers remainder
-      }
-      chunks.add(Chunk(id: i, start: start, end: end));
+      // First 'remainder' chunks get 1 extra byte each
+      int thisChunkSize = baseChunkSize + (i < remainder ? 1 : 0);
+      int end = currentStart + thisChunkSize - 1;
+
+      chunks.add(Chunk(id: i, start: currentStart, end: end));
+      currentStart = end + 1;
     }
+
     return chunks;
   }
 }

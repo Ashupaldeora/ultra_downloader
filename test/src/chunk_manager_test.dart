@@ -90,7 +90,8 @@ void main() {
       final strategy = const ChunkingStrategy(type: StrategyType.auto);
       final chunks = ChunkManager.calculateChunks(totalSize, strategy);
 
-      expect(chunks.length, 16);
+      // Auto strategy specifies 12 chunks for files > 500MB
+      expect(chunks.length, 12);
     });
 
     test('calculateChunks contiguous check', () {
