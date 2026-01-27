@@ -54,9 +54,12 @@ class _DownloaderIsolate {
   final Dio _dio = Dio();
 
   _DownloaderIsolate(this._mainSendPort) {
-    // Reasonable timeouts to prevent hung connections
+    // Timeouts: connect quickly, but allow slow data on bad networks
     _dio.options.connectTimeout = const Duration(seconds: 30);
-    _dio.options.receiveTimeout = const Duration(seconds: 30);
+    // CRITICAL: receiveTimeout is time between data packets, NOT total download time.
+    // For video downloads over slow/congested networks, we need a longer timeout.
+    // 5 minutes allows for brief network hiccups without failing the download.
+    _dio.options.receiveTimeout = const Duration(minutes: 5);
   }
 
   /// Sends a log message to the main isolate for debug output.
@@ -230,7 +233,22 @@ class _DownloaderIsolate {
       }
 
       // Wait for all chunk downloads to complete (or error)
-      await Future.wait(futures);
+      // CRITICAL: We use eagerError: false so that if one chunk fails,
+      // we wait for ALL chunks to either complete or be cancelled before proceeding.
+      // This prevents the race condition where we close files while chunks are still writing.
+      try {
+        await Future.wait(futures, eagerError: false);
+      } catch (e) {
+        // One or more chunks failed. Cancel all remaining operations FIRST,
+        // then let the error propagate up.
+        _log("Chunk failure detected, cancelling remaining operations...");
+        runtime.cancelAll();
+
+        // Give running streams a moment to process cancellation
+        await Future.delayed(const Duration(milliseconds: 100));
+
+        rethrow;
+      }
 
       // -----------------------------------------------------------------------
       // PHASE 7: CRITICAL - Flush ALL buffers before checking completion
@@ -250,6 +268,12 @@ class _DownloaderIsolate {
       }
     } catch (e, st) {
       if (runtime.isCancelled) return;
+
+      // CRITICAL: Cancel all operations BEFORE handling error!
+      // This ensures no chunk is still writing when we close file handles.
+      runtime.cancelAll();
+      await Future.delayed(const Duration(milliseconds: 100));
+
       _handleError(runtime, e, st);
     } finally {
       // Cleanup: Remove from active tasks if not still downloading
@@ -499,9 +523,15 @@ class _DownloaderIsolate {
       final destination = File(runtime.task.savePath);
       if (destination.existsSync()) destination.deleteSync();
 
+      // CRITICAL: Sort chunks by ID to ensure correct byte order!
+      // While chunks should already be in order, this guards against
+      // any edge cases where JSON parsing or list manipulation changed order.
+      final sortedChunks = List<Chunk>.from(runtime.task.chunks)
+        ..sort((a, b) => a.id.compareTo(b.id));
+
       final sink = destination.openWrite(mode: FileMode.write);
 
-      for (var chunk in runtime.task.chunks) {
+      for (var chunk in sortedChunks) {
         final partFile = File(runtime.getPartPath(chunk));
         await sink.addStream(partFile.openRead());
       }
@@ -509,6 +539,20 @@ class _DownloaderIsolate {
       // Ensure all data is written to disk
       await sink.flush();
       await sink.close();
+
+      // -----------------------------------------------------------------------
+      // STEP 3.5: VERIFY FINAL FILE SIZE
+      // -----------------------------------------------------------------------
+      // This is the ULTIMATE corruption check. If the merged file doesn't
+      // match the expected total size, something went wrong.
+      final finalSize = destination.lengthSync();
+      if (finalSize != runtime.task.totalSize) {
+        throw Exception(
+            "CORRUPTION DETECTED! Final file size $finalSize bytes does not "
+            "match expected ${runtime.task.totalSize} bytes. Parts may be "
+            "incomplete or overlapping.");
+      }
+      _log("✅ Merge verified: $finalSize bytes matches expected");
 
       // -----------------------------------------------------------------------
       // STEP 4: Cleanup part files only after successful merge
@@ -540,6 +584,10 @@ class _DownloaderIsolate {
 
   /// Handles download errors by updating status and notifying listeners.
   void _handleError(_TaskRuntime runtime, Object e, StackTrace st) {
+    // CRITICAL: Flush all buffered data to preserve progress before marking failed.
+    // Without this, retrying would have inaccurate progress and potential gaps.
+    runtime.flushAllBuffers();
+
     runtime.task.status = DownloadStatus.failed;
     runtime.task.errorMessage = e.toString();
     _log("Download failed: $e\n$st");
@@ -777,7 +825,14 @@ class _TaskRuntime {
     if (buffer == null || buffer.isEmpty) return;
 
     final raf = _openFiles[chunk.id];
-    if (raf == null) return; // File should have been opened
+    if (raf == null) {
+      // File handle not open - this should never happen during active download!
+      // Log this so we can diagnose if it occurs.
+      logger(
+          "⚠️ CRITICAL: Attempted flush on chunk ${chunk.id} but file handle is null! "
+          "Buffer has ${buffer.length} bytes that will be LOST!");
+      return;
+    }
 
     final data = buffer.takeBytes();
     try {

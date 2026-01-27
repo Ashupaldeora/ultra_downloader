@@ -232,6 +232,12 @@ class ChunkManager {
     // Ensure we don't have more chunks than bytes
     if (count > totalSize) count = totalSize;
 
+    // EDGE CASE: Empty file (0 bytes)
+    // Return empty chunk list - nothing to download
+    if (totalSize == 0 || count == 0) {
+      return [];
+    }
+
     List<Chunk> chunks = [];
 
     // Integer division: base size per chunk
