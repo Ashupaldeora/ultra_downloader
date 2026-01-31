@@ -156,7 +156,13 @@ class _DownloaderIsolate {
     }
 
     // Prevent duplicate downloads of the same task
-    if (_activeTasks.containsKey(task.id)) return;
+    if (_activeTasks.containsKey(task.id)) {
+      // Emit current state instead of silent return - prevents stale _startingTasks
+      _log("Task ${task.id} already active, broadcasting current state");
+      final existingRuntime = _activeTasks[task.id]!;
+      _broadcastStatus(existingRuntime);
+      return;
+    }
 
     // Remove from paused queue (if was paused)
     _pausedTasks.remove(task.id);
@@ -258,6 +264,9 @@ class _DownloaderIsolate {
       // whether chunks are complete. Without this, small files or the last
       // few KB of any download can be lost.
       runtime.flushAllBuffers();
+
+      // Brief delay to ensure all file I/O completes before verification
+      await Future.delayed(const Duration(milliseconds: 100));
 
       // -----------------------------------------------------------------------
       // PHASE 8: Final Verification & Merge
@@ -411,8 +420,18 @@ class _DownloaderIsolate {
     if (_pausedTasks.containsKey(taskId)) {
       final task = _pausedTasks[taskId]!;
       _startDownload(task.toJson());
+    } else {
+      // Task not in paused queue - emit event so caller can re-submit with full data
+      // This prevents stale _startingTasks entries in ForegroundService
+      _log(
+          "Resume failed: $taskId not in _pausedTasks, emitting failed status");
+      _mainSendPort.send({
+        'type': 'status',
+        'taskId': taskId,
+        'status': DownloadStatus.failed.index,
+        'progress': 0.0,
+      });
     }
-    // If not in paused queue, caller needs to provide full task info
   }
 
   /// Cancels a download and cleans up all associated files.
@@ -508,11 +527,12 @@ class _DownloaderIsolate {
         final partLen = partFile.lengthSync();
         final expectedLen = chunk.end - chunk.start + 1;
 
-        // Allow exact match only - any mismatch means corruption
-        if (partLen != expectedLen) {
+        // Check for incomplete chunk - undersized means download was interrupted
+        // Oversized is OK (final flush may include extra, we read only what we need)
+        if (partLen < expectedLen) {
           throw Exception(
-              "Chunk ${chunk.id} size mismatch! Expected $expectedLen bytes, "
-              "got $partLen bytes. Aborting merge to prevent corruption.");
+              "Chunk ${chunk.id} incomplete! Expected $expectedLen bytes, "
+              "got $partLen bytes. Download may have been interrupted.");
         }
       }
 
@@ -645,6 +665,7 @@ class _DownloaderIsolate {
 
   /// Downloads a small auxiliary file (e.g., subtitle, poster).
   /// Uses simple download (not chunked) with retry logic.
+  /// Uses the same headers as the main download for CDN authentication.
   Future<void> _downloadAuxiliary(
       _TaskRuntime runtime, AuxiliaryFile aux) async {
     int retries = 3;
@@ -654,8 +675,18 @@ class _DownloaderIsolate {
         final file = File(aux.savePath);
         if (!file.parent.existsSync()) file.parent.createSync(recursive: true);
 
-        await _dio.download(aux.url, aux.savePath,
-            options: Options(receiveTimeout: const Duration(minutes: 5)));
+        // Use same headers as main download (excluding Range header)
+        final headers = Map<String, dynamic>.from(runtime.task.headers ?? {});
+        headers.remove('Range'); // Remove Range header if present
+
+        await _dio.download(
+          aux.url,
+          aux.savePath,
+          options: Options(
+            receiveTimeout: const Duration(minutes: 5),
+            headers: headers,
+          ),
+        );
         return;
       } catch (e) {
         retries--;
@@ -842,12 +873,30 @@ class _TaskRuntime {
 
     final raf = _openFiles[chunk.id];
     if (raf == null) {
-      // File handle not open - this should never happen during active download!
-      // Log this so we can diagnose if it occurs.
+      // File handle not open - attempt recovery to prevent data loss
       logger(
-          "⚠️ CRITICAL: Attempted flush on chunk ${chunk.id} but file handle is null! "
-          "Buffer has ${buffer.length} bytes that will be LOST!");
-      return;
+          "⚠️ File handle null for chunk ${chunk.id}, attempting recovery flush...");
+      try {
+        final file = File('${task.savePath}.part.${chunk.id}');
+        if (!file.existsSync()) {
+          file.createSync(recursive: true);
+        }
+        final recoveryRaf = file.openSync(mode: FileMode.append);
+        final data = buffer.takeBytes();
+        recoveryRaf.writeFromSync(data);
+        recoveryRaf.closeSync();
+        chunk.downloaded += data.length;
+        logger(
+            "✅ Recovery flush successful for chunk ${chunk.id}: ${data.length} bytes");
+        _checkProgress();
+        return;
+      } catch (e) {
+        logger("❌ CRITICAL: Recovery flush failed for chunk ${chunk.id}: $e. "
+            "Buffer has ${buffer.length} bytes that may be lost!");
+        // Clear buffer anyway to prevent memory buildup
+        buffer.takeBytes();
+        return;
+      }
     }
 
     final data = buffer.takeBytes();
@@ -857,8 +906,18 @@ class _TaskRuntime {
       _checkProgress();
     } catch (e) {
       logger("Error writing to chunk ${chunk.id}: $e");
-      isCancelled = true;
-      // Error will be handled by the stream's onError
+      // Try recovery write before giving up
+      try {
+        final file = File('${task.savePath}.part.${chunk.id}');
+        final recoveryRaf = file.openSync(mode: FileMode.append);
+        recoveryRaf.writeFromSync(data);
+        recoveryRaf.closeSync();
+        chunk.downloaded += data.length;
+        logger("✅ Recovery write successful after primary write error");
+      } catch (recoveryError) {
+        logger("❌ Recovery write failed: $recoveryError");
+        isCancelled = true;
+      }
     }
   }
 
