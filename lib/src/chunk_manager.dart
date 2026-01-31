@@ -114,11 +114,16 @@ class DownloadTask {
     this.errorMessage,
   });
 
+  /// Returns download progress as a value between 0.0 and 1.0.
+  ///
+  /// Clamped to prevent overflow when chunk.downloaded slightly exceeds
+  /// expected size due to buffer timing or recovery edge cases.
   double get progress {
     if (totalSize == 0) return 0.0;
-    int totalDownloaded =
+    final totalDownloaded =
         chunks.fold(0, (sum, chunk) => sum + chunk.downloaded);
-    return totalDownloaded / totalSize;
+    final raw = totalDownloaded / totalSize;
+    return raw > 1.0 ? 1.0 : (raw < 0.0 ? 0.0 : raw);
   }
 
   factory DownloadTask.fromJson(Map<String, dynamic> json) {

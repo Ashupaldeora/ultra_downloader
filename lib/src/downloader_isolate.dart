@@ -487,14 +487,12 @@ class _DownloaderIsolate {
 
   /// Merges all chunk part files into the final destination file.
   ///
+  /// Optimized with buffered I/O (4MB chunks) to reduce the stall at 99%.
   /// CRITICAL: All file handles must be closed BEFORE reading part files.
-  /// This ensures the OS file system cache is flushed and we read complete data.
   Future<void> _completeTask(_TaskRuntime runtime) async {
     try {
       // -----------------------------------------------------------------------
       // STEP 1: Close all file handles FIRST
-      // This ensures all buffered data is flushed to the OS and files are
-      // readable by other handles. Without this, we might read stale data.
       // -----------------------------------------------------------------------
       runtime.closeAllFiles();
 
@@ -510,6 +508,7 @@ class _DownloaderIsolate {
         final partLen = partFile.lengthSync();
         final expectedLen = chunk.end - chunk.start + 1;
 
+        // Allow exact match only - any mismatch means corruption
         if (partLen != expectedLen) {
           throw Exception(
               "Chunk ${chunk.id} size mismatch! Expected $expectedLen bytes, "
@@ -518,55 +517,64 @@ class _DownloaderIsolate {
       }
 
       // -----------------------------------------------------------------------
-      // STEP 3: Merge all parts into destination file
+      // STEP 3: Merge with buffered I/O (4MB buffer for performance)
       // -----------------------------------------------------------------------
       final destination = File(runtime.task.savePath);
       if (destination.existsSync()) destination.deleteSync();
 
-      // CRITICAL: Sort chunks by ID to ensure correct byte order!
-      // While chunks should already be in order, this guards against
-      // any edge cases where JSON parsing or list manipulation changed order.
+      // Sort chunks by ID for correct byte order
       final sortedChunks = List<Chunk>.from(runtime.task.chunks)
         ..sort((a, b) => a.id.compareTo(b.id));
 
-      final sink = destination.openWrite(mode: FileMode.write);
+      // Use RandomAccessFile for more control and better performance
+      final raf = await destination.open(mode: FileMode.write);
+      const bufferSize = 4 * 1024 * 1024; // 4MB buffer
 
-      for (var chunk in sortedChunks) {
-        final partFile = File(runtime.getPartPath(chunk));
-        await sink.addStream(partFile.openRead());
+      try {
+        for (var chunk in sortedChunks) {
+          final partFile = File(runtime.getPartPath(chunk));
+          final partRaf = await partFile.open(mode: FileMode.read);
+
+          try {
+            while (true) {
+              final bytes = await partRaf.read(bufferSize);
+              if (bytes.isEmpty) break;
+              await raf.writeFrom(bytes);
+            }
+          } finally {
+            await partRaf.close();
+          }
+        }
+
+        await raf.flush();
+      } finally {
+        await raf.close();
       }
 
-      // Ensure all data is written to disk
-      await sink.flush();
-      await sink.close();
-
       // -----------------------------------------------------------------------
-      // STEP 3.5: VERIFY FINAL FILE SIZE
+      // STEP 4: VERIFY FINAL FILE SIZE
       // -----------------------------------------------------------------------
-      // This is the ULTIMATE corruption check. If the merged file doesn't
-      // match the expected total size, something went wrong.
       final finalSize = destination.lengthSync();
       if (finalSize != runtime.task.totalSize) {
         throw Exception(
             "CORRUPTION DETECTED! Final file size $finalSize bytes does not "
-            "match expected ${runtime.task.totalSize} bytes. Parts may be "
-            "incomplete or overlapping.");
+            "match expected ${runtime.task.totalSize} bytes.");
       }
-      _log("✅ Merge verified: $finalSize bytes matches expected");
+      _log("✅ Merge verified: $finalSize bytes");
 
       // -----------------------------------------------------------------------
-      // STEP 4: Cleanup part files only after successful merge
+      // STEP 5: Cleanup part files
       // -----------------------------------------------------------------------
       for (var chunk in runtime.task.chunks) {
         try {
           File(runtime.getPartPath(chunk)).deleteSync();
         } catch (e) {
-          _log("Warning: Failed to delete merged part file ${chunk.id}: $e");
+          _log("Warning: Failed to delete part file ${chunk.id}: $e");
         }
       }
 
       // -----------------------------------------------------------------------
-      // STEP 5: Update status and notify
+      // STEP 6: Update status and notify
       // -----------------------------------------------------------------------
       runtime.task.status = DownloadStatus.completed;
       _saveMetadata(runtime.task);
@@ -609,11 +617,19 @@ class _DownloaderIsolate {
   }
 
   /// Broadcasts progress/status update to main isolate and any registered monitors.
+  ///
+  /// When status is [DownloadStatus.completed], progress is forced to 1.0
+  /// to ensure notifications always show 100% for completed downloads.
   void _broadcastStatus(_TaskRuntime runtime) {
+    // Force 1.0 progress on completion - the merge is verified, so we know it's 100%
+    final progress = runtime.task.status == DownloadStatus.completed
+        ? 1.0
+        : runtime.task.progress;
+
     final payload = {
       'type': 'progress',
       'taskId': runtime.task.id,
-      'progress': runtime.task.progress,
+      'progress': progress,
       'status': runtime.task.status.index
     };
 
