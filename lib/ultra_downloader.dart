@@ -34,23 +34,27 @@ class UltraDownloader {
 
   bool _isInitialized = false;
   bool _debug = false;
+  void Function(String)? _onLog;
 
   Future<void>? _initFuture;
 
   /// Initialize the downloader. Must be called before use.
   /// Set [debug] to true to enable console logs.
-  Future<void> initialize({bool debug = false}) {
+  /// Optionally pass [onLog] callback to receive all isolate log messages.
+  Future<void> initialize({bool debug = false, void Function(String)? onLog}) {
     if (_isInitialized) return Future.value();
 
     // Return existing future if initialization is already in progress
     if (_initFuture != null) return _initFuture!;
 
-    _initFuture = _initializeInternal(debug);
+    _initFuture = _initializeInternal(debug, onLog);
     return _initFuture!;
   }
 
-  Future<void> _initializeInternal(bool debug) async {
+  Future<void> _initializeInternal(
+      bool debug, void Function(String)? onLog) async {
     _debug = debug;
+    _onLog = onLog;
 
     _receivePort = ReceivePort();
     final completer = Completer<void>();
@@ -66,8 +70,11 @@ class UltraDownloader {
         if (!completer.isCompleted) completer.complete();
       } else if (message is Map) {
         final type = message['type'];
-        if (type == 'log' && _debug) {
-          debugPrint('[UltraIsolate] ${message['msg']}');
+        if (type == 'log') {
+          final msg = message['msg'] as String;
+          if (_debug) debugPrint('[UltraIsolate] $msg');
+          // Call external log handler if provided
+          _onLog?.call(msg);
         } else if (type == 'progress' || type == 'status') {
           final taskId = message['taskId'] as String;
           final progress = (message['progress'] as num?)?.toDouble() ?? 0.0;

@@ -342,6 +342,8 @@ class _DownloaderIsolate {
             completer.complete();
           },
           onError: (e) {
+            // CRITICAL: Flush whatever we have before failing so we resume accurately
+            runtime.flush(chunk);
             completer.completeError(e);
           },
           cancelOnError: true,
